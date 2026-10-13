@@ -33,7 +33,8 @@
 ;             没出现：“等待 Live Captions 出现…”（黑色）；
 ;             出现了没字幕：“已连接，等待字幕出现…”（黑色）；
 ;             有字幕：“已保存 XX 段 · 抓取 xxx 字符”（灰色）；
-; 再加一个关闭按钮，关闭时把最后一点新增也写进去。
+; 小窗口：第一行文件名（可点击打开），第二行三种状态指示；
+; 右上角自带关闭按钮，关闭时把最后一点新增也写进去。
 ;
 ; 需要：AutoHotkey v2（https://www.autohotkey.com/）
 ;       同目录下的 UIA.ahk（Descolada，MIT 协议）
@@ -66,19 +67,28 @@ global writeQueue := ""  ; 待写入文件的内容队列（文件被占用时�
 global statusCtl := 0, fileCtl := 0
 global fileShown := false  ; 第一行当前是不是文件名（可点状态）
 global hoverOn := false    ; 鼠标是否悬停在文件名上
+global openBtn := 0, autoChk := 0  ; 打开按钮 / 自动打开复选框（未 hook 时才显示）
+
+; ---------------- 配置（INI，程序旁边） ----------------
+global iniFile := A_ScriptDir "\LiveCaptionsSaver.ini"
+global autoOpenLC := IniRead(iniFile, "Settings", "AutoOpenLiveCaptions", "0") = "1"
 
 ; ---------------- 窗口 ----------------
 ; 第一行：文件名（黑色，悬停下划线+手型光标，点击打开）；没文件时空着
 ; 第二行：三种状态指示（等待提示黑色，计数灰色）
 g := Gui("+AlwaysOnTop -MaximizeBox", "实时字幕保存")
 g.SetFont("s10", "Microsoft YaHei")
-statusCtl := g.Add("Text", "x14 y12 w292", "")
+statusCtl := g.Add("Text", "x14 y12 w222", "")
 statusCtl.OnEvent("Click", (*) => OpenSaveFile())
-fileCtl   := g.Add("Text", "x14 y36 w292", "等待 Live Captions 出现…")
-btn := g.Add("Button", "x14 y62 w292 h30", "关闭")
-btn.OnEvent("Click", (*) => DoExit())
-g.OnEvent("Close", (*) => DoExit())
-g.Show("w320 h106")
+fileCtl   := g.Add("Text", "x14 y36 w222", "等待 Live Captions 出现…")
+; 第三行：打开按钮 + 自动打开选项（只在未 hook 时显示）
+openBtn := g.Add("Button", "x14 y62 w110 h26", "打开实时字幕")
+openBtn.OnEvent("Click", (*) => OpenLiveCaptions())
+autoChk := g.Add("Checkbox", "x132 y67", "启动时自动打开")
+autoChk.Value := autoOpenLC
+autoChk.OnEvent("Click", (*) => SaveAutoOpen(autoChk.Value))
+g.OnEvent("Close", (*) => DoExit())  ; 标题栏自带 ✕，关闭时把最后一点新增也写进去
+g.Show("w250 h100")  ; 初始未 hook，第三行（按钮+选项）露着
 
 ; 文件名悬停时显示手型光标+下划线（常驻下划线会跟文件名里的下划线重叠）
 hHand := DllCall("LoadCursor", "Ptr", 0, "Ptr", 32649, "Ptr")
@@ -110,6 +120,10 @@ HoverCheck() {
 
 SetTimer(WatchTimer, WATCH_MS)
 WatchTimer()  ; 立刻跑一次，不等第一个 2 秒（否则第二行颜色/状态会闪一下）
+if (autoOpenLC) {
+    ; 启动时自动打开：只试一次（用户手动关掉的不再打扰）
+    SetTimer(() => OpenLiveCaptions(), -1500)
+}
 
 ; ---------------- 等待出现 / 守护连接 ----------------
 ; 三种状态的指示都在第二行：没出现 / 出现了没字幕 / 有字幕（统计）
@@ -150,6 +164,7 @@ HookOK() {
     pendingBreak := false
     statusCtl.Text := fileName
     fileShown := true  ; 第一行现在是文件名，可点（悬停下划线+手型）
+    UpdateActionRow()  ; hook 上了，藏起第三行
     RefreshStats()
     SetTimer(PollTimer, POLL_MS)
 }
@@ -162,6 +177,7 @@ Unhook(line2msg := "") {
     lineOpen := false
     pendingBreak := false
     SetTimer(PollTimer, 0)
+    UpdateActionRow()  ; 断开了，露出第三行（按钮+选项）
     if (line2msg != "")
         SetLine2(line2msg)
 }
@@ -468,6 +484,50 @@ OpenSaveFile() {
     if (!fileShown || saveFile = "")
         return
     try Run('"' saveFile '"')
+}
+
+; ---------------- 打开 Live Captions ----------------
+; 按钮只在未 hook 时显示；直接跑系统 exe（不是 Win+Ctrl+L 开关，更可靠，
+; 重复启动也无害）
+OpenLiveCaptions() {
+    global openBtn, LC_CLASS
+    if (WinExist(LC_CLASS))
+        return
+    openBtn.Enabled := false  ; 防连点
+    try Run(A_WinDir "\System32\LiveCaptions.exe")
+    ; 3 秒后如果还没 hook 上，恢复按钮（WatchTimer 会自己隐藏已 hook 的）
+    SetTimer(() => RestoreOpenBtn(), -3000)
+}
+
+RestoreOpenBtn() {
+    global openBtn, hooked
+    if (!hooked)
+        openBtn.Enabled := true
+}
+
+; 保存"启动时自动打开"选项到 INI
+SaveAutoOpen(val) {
+    global iniFile, autoOpenLC
+    autoOpenLC := !!val
+    try {
+        IniWrite(autoOpenLC ? "1" : "0", iniFile, "Settings", "AutoOpenLiveCaptions")
+    } catch {
+        ; 目录不可写（如 Program Files），选项本次有效、下次不记
+    }
+}
+
+; 第三行显隐：未 hook 显示（窗口变高），hook 上后隐藏
+UpdateActionRow() {
+    global hooked, openBtn, autoChk, g
+    show := !hooked
+    openBtn.Visible := show
+    autoChk.Visible := show
+    if (show) {
+        openBtn.Enabled := true
+        g.Show("w250 h100")
+    } else {
+        g.Show("w250 h70")
+    }
 }
 
 ; ---------------- 杂项 ----------------
