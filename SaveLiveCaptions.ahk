@@ -8,9 +8,13 @@
 ;
 ; 逻辑：
 ;   1. 每 1 秒读一次字幕全文（保留字幕自带的换行，只压缩横向空格）；
-;   2. 跟上次读到的求差值：先看上次的尾巴跟这次的开头重叠多少
-;      （上次 ABC、这次 BCD → 重叠 BC，只取 D），
-;      再看最长公共前缀（识别器在中间改了词的情况），取重叠最多的；
+;   2. 跟上次读到的求差值（单词为单位）：纯追加走字符串前缀快路径；
+;      否则按单词做贪心子序列匹配，只取匹配不上的新词/改词。
+;      例如上次 AA BB CC EE、这次 BB CD EE FF → 只取 CD FF
+;      （AA 滚出去了，BB/EE 是公共部分，CC→CD 是改词用改后的，FF 新增）；
+;   3. 有改词时文件同步：在文件尾定位到最后一个旧词（锚点），
+;      原地截断后重写改词后的内容，而不是把新旧都追加
+;      （原地改，Notepad++ 监视不断；失败则退回追加，数据不丢）；
 ;   3. 有新增就往当前行后面追加；字幕自带的换行会保留（字幕里断行，文件里也断行）；
 ;      没遇到断句标点（。！？.!? 共 6 个）就一直追加到同一行；
 ;      增量里有几个标点就断几次行，每段在标点处收行，
@@ -192,20 +196,9 @@ PollTimer() {
     if (text = lastText) {
         unchanged++
     } else {
-        inc := DiffIncrement(lastText, text)
-        if (Trim(inc) != "") {
-            ; 欠着一次静默换行：看新内容开头是不是断句标点
-            if (pendingBreak && lineOpen) {
-                pendingBreak := false
-                if (!InStr("。！？.!?", SubStr(LTrim(inc), 1, 1))) {
-                    ; 开头不是标点：先换行，再写新内容
-                    QueueWrite("`r`n")
-                    lineOpen := false
-                }
-                ; 开头是标点：直接接到当前行，标点处自然收行
-            }
-            AppendToLine(inc)  ; 原样追加，空格用字幕自带的，不自己加
-        }
+        diff := WordDiffIncrement(lastText, text)
+        if (Trim(diff.inc) != "")
+            ApplyDiff(diff)  ; 有改词则文件同步，无改词则追加（含欠着的静默换行）
         unchanged := 0
         lastText := text
     }
@@ -225,37 +218,192 @@ NormalizeText(s) {
     return Trim(s, " `t`r`n")
 }
 
-; text 相对于 lastText 的新增部分。
-; 先看滚动：lastText 的最长后缀 = text 的最长前缀
-;   （上次 ABC，这次 BCD → 重叠 BC，只取 D）；
-; 再看修订：最长公共前缀（识别器在中间改了词的情况）；
-; 取重叠最多的那个。
-DiffIncrement(lastText, text) {
+; text 相对于 lastText 的差值（单词为单位），返回 {inc, isRevision, anchor, syncText}。
+; text 相对于 lastText 的差值（单词为单位），返回 {inc, isRevision, anchor, syncText}。
+; inc: 新词/改词（带原始分隔符），追加用；
+; isRevision: 是否有改词（需要文件同步）；anchor: 锚点词（最后一个旧词）；
+; syncText: 从第一个新词起的原文（含分隔符），同步时写入。
+; 例如上次 AA BB CC EE、这次 BB CD EE FF → inc=" CD FF"，isRevision=true，
+; anchor="BB"，syncText=" CD EE FF"。
+WordDiffIncrement(lastText, text) {
+    result := {inc: "", isRevision: false, anchor: "", syncText: ""}
+    if (lastText = "")
+        return result
     lt := StrLen(lastText)
-    tt := StrLen(text)
-    if (lt = 0)
-        return text
-    ; 快路径：纯追加（最常见），一次字符串比较搞定
-    if (SubStr(text, 1, lt) = lastText)
-        return SubStr(text, lt + 1)
-    maxK := Min(lt, tt)
-    best := 0
-    ; A: 滚动
-    k := maxK
-    while (k > best) {
-        if (SubStr(lastText, lt - k + 1, k) = SubStr(text, 1, k)) {
-            best := k
+    if (SubStr(text, 1, lt) = lastText) {
+        ; 纯追加快路径
+        result.inc := SubStr(text, lt + 1)
+        return result
+    }
+    ; 分词（记位置，用于还原分隔符）
+    prevWords := []
+    p := 1
+    while (RegExMatch(lastText, "\S+", &m, p)) {
+        prevWords.Push(m[0])
+        p := m.Pos + StrLen(m[0])
+    }
+    currWords := []  ; {w, pos, len}
+    p := 1
+    while (RegExMatch(text, "\S+", &m, p)) {
+        currWords.Push({w: m[0], pos: m.Pos, len: StrLen(m[0])})
+        p := m.Pos + StrLen(m[0])
+    }
+    if (currWords.Length = 0)
+        return result
+    ; prev 单词 -> 位置表（处理重复词）
+    posMap := Map()
+    for j, w in prevWords {
+        if (!posMap.Has(w))
+            posMap.Set(w, [])
+        posMap.Get(w).Push(j)
+    }
+    ; 贪心子序列匹配：curr 的词按顺序在 prev 里找，找到算旧词，找不到算新词/改词
+    isNew := []
+    prevMatched := []
+    Loop prevWords.Length
+        prevMatched.Push(false)
+    prevIdx := 1
+    for i, cw in currWords {
+        found := false
+        if (posMap.Has(cw.w)) {
+            for _, pj in posMap.Get(cw.w) {
+                if (pj >= prevIdx) {
+                    found := true
+                    prevMatched[pj] := true
+                    prevIdx := pj + 1
+                    break
+                }
+            }
+        }
+        isNew.Push(!found)
+    }
+    ; 拼 inc（只取新词，带原始分隔符）
+    inc := ""
+    prevEnd := 0
+    for i, cw in currWords {
+        if (isNew[i]) {
+            sep := SubStr(text, prevEnd + 1, cw.pos - prevEnd - 1)
+            inc .= sep . cw.w
+        }
+        prevEnd := cw.pos + cw.len - 1
+    }
+    result.inc := inc
+    ; 第一个新词
+    firstNew := 0
+    for i, nw in isNew {
+        if (nw) {
+            firstNew := i
             break
         }
-        k--
     }
-    ; B: 中间被改了词
-    i := 1
-    while (i <= maxK && SubStr(lastText, i, 1) = SubStr(text, i, 1))
-        i++
-    if (i - 1 > best)
-        best := i - 1
-    return SubStr(text, best + 1)
+    if (firstNew = 0)
+        return result
+    ; 检测改词：有没匹配上的 prev 词，且不在头部滚动区
+    firstMatched := 0
+    for j, mt in prevMatched {
+        if (mt) {
+            firstMatched := j
+            break
+        }
+    }
+    for j, mt in prevMatched {
+        if (!mt && j > firstMatched) {
+            result.isRevision := true
+            break
+        }
+    }
+    if (result.isRevision && firstNew > 1) {
+        result.anchor := currWords[firstNew - 1].w
+        pw := currWords[firstNew - 1]
+        result.syncText := SubStr(text, pw.pos + pw.len)
+    }
+    return result
+}
+
+; 应用 diff：有改词就尝试文件同步（定位锚点、截断重写），失败则退回追加。
+; 欠着的静默换行在这里统一处理（同步截断之后、写入之前，避免冲突）。
+ApplyDiff(diff) {
+    global pendingBreak, lineOpen
+    synced := false
+    if (diff.isRevision && diff.anchor != "" && diff.syncText != "") {
+        synced := SyncFileRewrite(diff.anchor, diff.syncText)
+        ; 成功时文件已截断到锚点词尾，lineOpen=true
+    }
+    writeText := synced ? diff.syncText : diff.inc
+    ; 欠着一次静默换行：看新内容开头是不是断句标点
+    if (pendingBreak && lineOpen) {
+        pendingBreak := false
+        if (!InStr("。！？.!?", SubStr(LTrim(writeText), 1, 1))) {
+            ; 开头不是标点：先换行，再写新内容
+            QueueWrite("`r`n")
+            lineOpen := false
+        }
+        ; 开头是标点：直接接到当前行，标点处自然收行
+    }
+    AppendToLine(writeText)  ; 原样追加，空格用字幕自带的，不自己加
+}
+
+; 文件同步：在文件尾找到 anchor，把它之后的内容替换为 syncText。
+; 成功返回 true；失败返回 false（调用方退回追加，数据不丢）。
+; 原地截断+重写（文件本身不替换，Notepad++ 的文件监视不会断）。
+SyncFileRewrite(anchor, syncText) {
+    global saveFile, lineOpen, writeQueue
+    FlushWrites()
+    if (writeQueue != "")
+        return false
+    try {
+        content := FileRead(saveFile, "UTF-8")
+    } catch {
+        return false
+    }
+    if (SubStr(content, 1, 1) = Chr(0xFEFF))
+        content := SubStr(content, 2)  ; 去 BOM，写回时统一加
+    truncPos := FindAnchorEnd(content, anchor)
+    if (truncPos = 0)
+        return false
+    truncated := SubStr(content, 1, truncPos)
+    if (!TruncateFileInPlace(truncated))
+        return false
+    lineOpen := true  ; 截断到词尾，行开着，调用方接着 AppendToLine(syncText)
+    return true
+}
+
+; 在 content 中找 anchor 的最后一个完整单词匹配（忽略词尾标点），
+; 返回该词尾的字符位置（1-based），找不到返回 0。
+FindAnchorEnd(content, anchor) {
+    anchorNorm := RegExReplace(anchor, "[.,!?;:，。！？]+$")
+    if (anchorNorm = "")
+        return 0
+    lastEnd := 0
+    p := 1
+    while (RegExMatch(content, "\S+", &m, p)) {
+        wNorm := RegExReplace(m[0], "[.,!?;:，。！？]+$")
+        if (wNorm = anchorNorm) {
+            lastEnd := m.Pos + StrLen(m[0]) - 1
+        }
+        p := m.Pos + StrLen(m[0])
+    }
+    return lastEnd
+}
+
+; 原地截断文件并写入新内容（"w" 模式是截断原文件，不是删除重建，
+; 文件本身不变，Notepad++ 监视不断），带重试。
+; 注意：这是有风险的操作——如果在截断和写完之间崩溃，尾部会丢；
+; 但按调用方的流程，失败会退回追加，极端情况下顶多丢几个词。
+TruncateFileInPlace(content) {
+    global saveFile
+    loop 8 {
+        try {
+            f := FileOpen(saveFile, "w", "UTF-8-RAW")
+            f.Write(Chr(0xFEFF))  ; BOM（文件原本就是 FileAppend UTF-8 创建的，带 BOM）
+            f.Write(content)
+            f.Close()
+            return true
+        } catch {
+            Sleep(200)
+        }
+    }
+    return false
 }
 
 ; 追加到当前行尾。先按字幕自带的换行切分（字幕里断行，文件里也断行），
@@ -362,9 +510,9 @@ DoExit() {
     try {
         text := NormalizeText(sv.Name)
         if (text != lastText) {
-            inc := DiffIncrement(lastText, text)
-            if (Trim(inc) != "")
-                AppendToLine(inc)
+            diff := WordDiffIncrement(lastText, text)
+            if (Trim(diff.inc) != "")
+                ApplyDiff(diff)
         }
         if (lineOpen) {
             QueueWrite("`r`n")
