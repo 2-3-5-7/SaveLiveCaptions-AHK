@@ -5,6 +5,14 @@
 这个版本按“启动即自动 hook、窗口只显示文件名和状态”的思路，用 AutoHotkey v2 重写，
 逻辑只剩几步。
 
+![](01.png)
+
+![](02.png)
+
+推荐配合 notepad++ 的 “**监控日志**”功能，获得文件的实时更新
+
+![image](03.png)
+
 ## 原理
 
 和原版一样，走 Windows UI Automation：
